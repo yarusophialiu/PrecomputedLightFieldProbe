@@ -99,7 +99,6 @@ ShaderLoader.prototype = (function() {
 
 				this.shaderFiles.push(fileName);
 				this.loadCounter += 1;
-
 			}
 
 		},
@@ -118,22 +117,6 @@ ShaderLoader.prototype = (function() {
 		},
 
 		load: function(onload) {
-
-			// In case there is nothing to load but programs can be assembled from what is already loaded.
-			// E.g.:
-			//   loader.addShaderFile('fileA');
-			//   loader.addShaderFile('fileB');
-			//   loader.load(...)
-			//   loader.addShaderProgram('program', 'fileA', 'fileB');
-			// * loader.load(...)
-			//
-			// The last load call should still return the program!
-			//
-			if (this.loadCounter === 0) {
-				this.onCompletion(onload);
-				return;
-			}
-
 			var scope = this;
 
 			for (var i = 0, len = this.shaderFiles.length; i < len; ++i) {

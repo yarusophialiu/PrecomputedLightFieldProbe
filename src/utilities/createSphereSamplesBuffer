@@ -1,0 +1,53 @@
+
+function createPointsInSphere(count) {
+	// count = 64 * 64
+	var size = count * 3;
+	var points = new Float32Array(size);
+
+	for (var i = 0; i < count; ++i) {
+
+		var x, y, z;
+		var lengthSquared;
+
+		while (true) {
+			x = Math.random() * 2.0 - 1.0;
+			y = Math.random() * 2.0 - 1.0;
+			z = Math.random() * 2.0 - 1.0;
+			lengthSquared = x*x + y*y + z*z;
+			if (lengthSquared < 1.0) break
+		}
+
+		var length = Math.sqrt(lengthSquared);
+		// project onto sphere
+		points[3 * i + 0] = x / length;
+		points[3 * i + 1] = y / length;
+		points[3 * i + 2] = z / length;
+	}
+
+	return points;
+}
+
+function createSphereSamplesUniformBuffer() {
+
+	// Make sure this matches the value in the shader!
+	var size = 64 * 64;
+
+	var description = new Array(size).fill(PicoGL.FLOAT_VEC4);
+	var uniformBuffer = app.createUniformBuffer(description);
+
+	// rejection sampling a sphere
+	var samples = createPointsInSphere(size); // 64 * 64 * 3
+
+	for (var i = 0; i < size; ++i) {
+		var sample = vec4.fromValues(
+			samples[3 * i + 0],
+			samples[3 * i + 1],
+			samples[3 * i + 2],
+			0.0
+		);
+		uniformBuffer.set(i, sample);
+	}
+
+	uniformBuffer.update();
+	return uniformBuffer;
+}

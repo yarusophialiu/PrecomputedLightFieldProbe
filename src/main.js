@@ -1,31 +1,10 @@
 'using strict';
-
-////////////////////////////////////////////////////////////////////////////////
-
-var stats;
-var gui;
-
-var settings = {
-	target_fps: 60,
-	environment_brightness: 1.5
-};
-
-var sceneSettings = {
-	ambientColor: new Float32Array([0.15, 0.15, 0.15, 1.0]),
-};
-
-////////////////////////////////////////////////////////////////////////////////
-
 var app;
-
-var gpuTimePanel;
-var picoTimer;
 
 var defaultShader;
 var shadowMapShader;
-
-var blitTextureDrawCall;
-var environmentDrawCall;
+var precomputeShader;
+var irradianceShader;
 
 var sceneUniforms;
 
@@ -37,75 +16,42 @@ var directionalLight;
 var meshes = [];
 
 var probeDrawCall;
-var probeLocations = [
-	-10, 4,  0,
-	+10, 4,  0,
-	-10, 14, 0,
-	+10, 14, 0
-]
+var probeOrigin;
+var probeCount;
+var probeStep;
+var probeLocations
+
+var probeOctahedrals = {};
+var irradianceSize;
+
+// probeFramebuffer
+var probeFramebuffer;
+var probeCubeSize = 256;
+var probeCubemaps;
+
+// precompute probes
+var precomputeThisFrame = false;
+var precomputeIndex = 0;
+var precomputeQueue = [];
+var precomputeTimes;
+
+// for more efficient implementation
+var irradianceFramebuffer;
+var irradianceSize = 128;
+
 
 window.addEventListener('DOMContentLoaded', function () {
 
 	init();
 	resize();
 
-	window.addEventListener('resize', resize, false);
+	window.addEventListener('resize', resize, true);
 	requestAnimationFrame(render);
 
 }, false);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility
-
-function checkWebGL2Compability() {
-
-	var c = document.createElement('canvas');
-	var webgl2 = c.getContext('webgl2');
-	if (!webgl2) {
-		var message = document.createElement('p');
-		message.id = 'no-webgl2-error';
-		message.innerHTML = 'WebGL 2.0 doesn\'t seem to be supported in this browser and is required for this demo! ' +
-			'It should work on most modern desktop browsers though.';
-		canvas.parentNode.replaceChild(message, document.getElementById('canvas'));
-		return false;
-	}
-	return true;
-
-}
-
-function loadTexture(imageName, options) {
-
-	if (!options) {
-
-		var options = {};
-		options['minFilter'] = PicoGL.LINEAR_MIPMAP_NEAREST;
-		options['magFilter'] = PicoGL.LINEAR;
-		options['mipmaps'] = true;
-
-	}
-
-	var texture = app.createTexture2D(1, 1, options);
-	texture.data(new Uint8Array([200, 200, 200, 256]));
-
-	var image = document.createElement('img');
-	image.onload = function() {
-
-		texture.resize(image.width, image.height);
-		texture.data(image);
-
-	};
-	image.src = 'assets/' + imageName;
-	return texture;
-
-}
-
-function makeShader(name, shaderLoaderData) {
-
-	var programData = shaderLoaderData[name];
-	var program = app.createProgram(programData.vertexSource, programData.fragmentSource);
-	return program;
-
-}
 
 function loadObject(directory, objFilename, mtlFilename, modelMatrix) {
 
@@ -117,27 +63,42 @@ function loadObject(directory, objFilename, mtlFilename, modelMatrix) {
 	objLoader.load(path + objFilename, function(objects) {
 		mtlLoader.load(path + mtlFilename, function(materials) {
 			objects.forEach(function(object) {
+				// object includes material: "BlackMarble"
+				// name: "living_room_living_room_BlackMarble"
+				// normals: Float32Array(396) [0, 0, -1, 0]
+				// positions: Float32Array(396) [-1.4697999]
+				// tangents: Float32Array(528) [-1, 0, 0, -1]
+				// uv2s: Float32Array [buffer: ArrayBuffer(0), byteLength: 0, byteOffset: 0, length: 0]
+				// uvs: Float32Array(264) [0.00266700005158782
 
-				var material = materials[object.material];
-				var diffuseMap  = (material.properties.map_Kd)   ? directory + material.properties.map_Kd   : 'default_diffuse.png';
-				var specularMap = (material.properties.map_Ks)   ? directory + material.properties.map_Ks   : 'default_specular.jpg';
-				var normalMap   = (material.properties.map_norm) ? directory + material.properties.map_norm : 'default_normal.jpg';
+				var material = materials[object.material]
+				var diffuseTexture  = loadDiffuseTexture(app, material, directory)
+				var specularTexture = loadTexture('default_specular.jpg');
+				var normalTexture = loadTexture('default_normal.jpg');
 
-				var vertexArray = createVertexArrayFromMeshInfo(object);
+				var vertexArray = createVertexArrayFromMeshInfo(object)
 
 				var drawCall = app.createDrawCall(defaultShader, vertexArray)
-				.uniformBlock('SceneUniforms', sceneUniforms)
-				.texture('u_diffuse_map', loadTexture(diffuseMap))
-				.texture('u_specular_map', loadTexture(specularMap))
-				.texture('u_normal_map', loadTexture(normalMap));
+					.uniformBlock('SceneUniforms', sceneUniforms)
+					.texture('u_diffuse_map', diffuseTexture)
+					.texture('u_specular_map', specularTexture)
+					.texture('u_normal_map', normalTexture);
 
-				var shadowMappingDrawCall = app.createDrawCall(shadowMapShader, vertexArray);
+				var shadowMapDrawCall = app.createDrawCall(shadowMapShader, vertexArray);
+
+				var precomputeDrawCall = app.createDrawCall(precomputeShader, vertexArray)
+					.uniformBlock('SceneUniforms', sceneUniforms)
+					.texture('u_diffuse_map', diffuseTexture)
+					.texture('u_specular_map', specularTexture)
+					.texture('u_normal_map', normalTexture);
 
 				meshes.push({
 					modelMatrix: modelMatrix || mat4.create(),
-					drawCall: drawCall,
-					shadowMapDrawCall: shadowMappingDrawCall
+					drawCall,
+					shadowMapDrawCall,
+					precomputeDrawCall
 				});
+				initiatePrecompute();
 
 			});
 		});
@@ -145,242 +106,132 @@ function loadObject(directory, objFilename, mtlFilename, modelMatrix) {
 
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Initialization etc.
-
 function init() {
-
-	if (!checkWebGL2Compability()) {
-		return;
-	}
-
 	var canvas = document.getElementById('canvas');
-	app = PicoGL.createApp(canvas, { antialias: true });
-
-	stats = new Stats();
-	stats.showPanel(1); // (frame time)
-	document.body.appendChild(stats.dom);
-
-	gpuTimePanel = stats.addPanel(new Stats.Panel('MS (GPU)', '#ff8', '#221'));
-	picoTimer = app.createTimer();
-
-	gui = new dat.GUI();
-	gui.add(settings, 'target_fps', 0, 120);
-	gui.add(settings, 'environment_brightness', 0.0, 2.0);
-
-	//////////////////////////////////////
+	app = PicoGL.createApp(canvas, { antialias: true })
+			
 	// Basic GL state
+	app.clearColor(0, 0, 0, 1)
+		.floatRenderTargets()
+		.linearFloatTextures()
+		.cullBackfaces()
+		.noBlend();
 
-	app.clearColor(0, 0, 0, 1);
-	app.cullBackfaces();
-	app.noBlend();
+	// Setup camera
 
-	//////////////////////////////////////
-	// Camera stuff
-
-	var cameraPos = vec3.fromValues(-15, 3, 0);
-	var cameraRot = quat.fromEuler(quat.create(), 15, -90, 0);
+	var cameraPos = vec3.fromValues(2.6, 1.6, 3.6);
+	var cameraRot = quat.fromEuler(quat.create(), -19, 70, 360);
 	camera = new Camera(cameraPos, cameraRot);
 
-	//////////////////////////////////////
-	// Scene setup
-
-	directionalLight = new DirectionalLight();
+	// Setup scene
+	var dir = vec3.fromValues(-0.15518534183502197, -0.22172605991363525, 0.962681233882904);
+	directionalLight = new DirectionalLight(dir, vec3.fromValues(1.0, 0.803, 0.433));
 	setupDirectionalLightShadowMapFramebuffer(shadowMapSize);
 
-	setupSceneUniforms();
+	// use up and down key to move directional light
+	document.addEventListener('keydown', e => {
+		var move;
+		if (e.keyCode == 38) move = 0.01; 
+		if (e.keyCode == 40) move = -0.01; 
+		if (move) {
+			vec3.rotateX(directionalLight.direction, directionalLight.direction, vec3.create(), move);
+		}
+	})
 
-	var shaderLoader = new ShaderLoader('src/shaders/');
-	shaderLoader.addShaderFile('common.glsl');
-	shaderLoader.addShaderFile('scene_uniforms.glsl');
-	shaderLoader.addShaderFile('mesh_attributes.glsl');
-	shaderLoader.addShaderProgram('unlit', 'unlit.vert.glsl', 'unlit.frag.glsl');
-	shaderLoader.addShaderProgram('default', 'default.vert.glsl', 'default.frag.glsl');
-	shaderLoader.addShaderProgram('environment', 'environment.vert.glsl', 'environment.frag.glsl');
-	shaderLoader.addShaderProgram('textureBlit', 'screen_space.vert.glsl', 'texture_blit.frag.glsl');
-	shaderLoader.addShaderProgram('shadowMapping', 'shadow_mapping.vert.glsl', 'shadow_mapping.frag.glsl');
-	shaderLoader.load(function(data) {
+
+	// set ambientColor
+	sceneUniforms = app.createUniformBuffer([PicoGL.FLOAT_VEC4])
+						.set(0, new Float32Array([1.0, 1.0, 1.0, 1.0]),)
+						.update();
+
+	var shaderLoader = getShaderLoader();
+
+	shaderLoader.load(function(loaders) {
+		console.log('shader loader data ', loaders)
+		defaultShader = makeShader(app, 'default', loaders);
+		shadowMapShader = makeShader(app, 'shadowMapping', loaders);
+		precomputeShader = makeShader(app, 'precompute', loaders);
+		irradianceShader = makeShader(app, 'irradianceMap', loaders);
 
 		var fullscreenVertexArray = createFullscreenVertexArray();
+		irradianceDrawCall = app.createDrawCall(irradianceShader, fullscreenVertexArray)
+								.uniformBlock('SphereSamples', createSphereSamplesUniformBuffer());
 
-		var textureBlitShader = makeShader('textureBlit', data);
-		blitTextureDrawCall = app.createDrawCall(textureBlitShader, fullscreenVertexArray);
-
-		var environmentShader = makeShader('environment', data);
-		environmentDrawCall = app.createDrawCall(environmentShader, fullscreenVertexArray)
-		.texture('u_environment_map', loadTexture('environments/ocean.jpg', {}));
-
-		var unlitShader = makeShader('unlit', data);
+		// Setup and draw probes
+		var unlitShader = makeShader(app, 'unlit', loaders);
 		var probeVertexArray = createSphereVertexArray(0.08, 8, 8);
+		probeOrigin, probeStep, probeCount, probeLocations = placeProbes()
 		setupProbeDrawCall(probeVertexArray, unlitShader);
 
-		defaultShader = makeShader('default', data);
-		shadowMapShader = makeShader('shadowMapping', data);
-		loadObject('sponza/', 'sponza.obj', 'sponza.mtl');
+		// Load objects
+		let m = mat4.create(); 
+		let r = quat.fromEuler(quat.create(), 0, 0, 0); // Creates a quaternion from the given euler angle x, y, z.
+		let t = vec3.fromValues(0, 0, 0);
+		let s = vec3.fromValues(1, 1, 1);
+		// Creates a matrix from a quaternion rotation, vector translation and vector scale 
+		mat4.fromRotationTranslationScale(m, r, t, s);
+		loadObject('living_room/', 'living_room.obj', 'living_room.mtl', m);
+		// loadObject('test_room/', 'test_room.obj', 'test_room.mtl', m);
 
-	});
-
-}
-
-function createFullscreenVertexArray() {
-
-	var positions = app.createVertexBuffer(PicoGL.FLOAT, 3, new Float32Array([
-		-1, -1, 0,
-		+3, -1, 0,
-		-1, +3, 0
-	]));
-
-	var vertexArray = app.createVertexArray()
-	.vertexAttributeBuffer(0, positions);
-
-	return vertexArray;
+		setupProbes();
+	})
 
 }
 
-function createSphereVertexArray(radius, rings, sectors) {
+function setupProbes() {
 
-	var positions = [];
+	// Cubemap 
+	probeFramebuffer = app.createFramebuffer();
+	probeCubemaps = getProbeCubemaps(app, probeCubeSize) // 256
 
-	var R = 1.0 / (rings - 1);
-	var S = 1.0 / (sectors - 1);
-
-	var PI = Math.PI;
-	var TWO_PI = 2.0 * PI;
-
-	for (var r = 0; r < rings; ++r) {
-		for (var s = 0; s < sectors; ++s) {
-
-			var y = Math.sin(-(PI / 2.0) + PI * r * R);
-			var x = Math.cos(TWO_PI * s * S) * Math.sin(PI * r * R);
-			var z = Math.sin(TWO_PI * s * S) * Math.sin(PI * r * R);
-
-			positions.push(x * radius);
-			positions.push(y * radius);
-			positions.push(z * radius);
-
-		}
-	}
-
-	var indices = [];
-
-	for (var r = 0; r < rings - 1; ++r) {
-		for (var s = 0; s < sectors - 1; ++s) {
-
-			var i0 = r * sectors + s;
-			var i1 = r * sectors + (s + 1);
-			var i2 = (r + 1) * sectors + (s + 1);
-			var i3 = (r + 1) * sectors + s;
-
-			indices.push(i2);
-			indices.push(i1);
-			indices.push(i0);
-
-			indices.push(i3);
-			indices.push(i2);
-			indices.push(i0);
-
-		}
-	}
-
-	var positionBuffer = app.createVertexBuffer(PicoGL.FLOAT, 3, new Float32Array(positions));
-	var indexBuffer = app.createIndexBuffer(PicoGL.UNSIGNED_SHORT, 3, new Uint16Array(indices));
-
-	var vertexArray = app.createVertexArray()
-	.vertexAttributeBuffer(0, positionBuffer)
-	.indexBuffer(indexBuffer);
-
-	return vertexArray;
+	// Octahedral
+	irradianceFramebuffer = app.createFramebuffer();
+	probeOctahedrals = getProbeOctahedrals(app, irradianceSize, irradianceSize, probeLocations.length)
 
 }
 
 function setupDirectionalLightShadowMapFramebuffer(size) {
-
-	var colorBuffer = app.createTexture2D(size, size, {
-		format: PicoGL.RED,
-		internalFormat: PicoGL.R8,
-		minFilter: PicoGL.NEAREST,
-		magFilter: PicoGL.NEAREST
-	});
-
 	var depthBuffer = app.createTexture2D(size, size, {
 		format: PicoGL.DEPTH_COMPONENT
 	});
 
 	shadowMapFramebuffer = app.createFramebuffer()
-	.colorTarget(0, colorBuffer)
-	.depthTarget(depthBuffer);
-
-}
-
-function setupSceneUniforms() {
-
-	//
-	// TODO: Fix all this! I got some weird results when I tried all this before but it should work...
-	//
-
-	sceneUniforms = app.createUniformBuffer([
-		PicoGL.FLOAT_VEC4 /* 0 - ambient color */   //,
-		//PicoGL.FLOAT_VEC4 /* 1 - directional light color */,
-		//PicoGL.FLOAT_VEC4 /* 2 - directional light direction */,
-		//PicoGL.FLOAT_MAT4 /* 3 - view from world matrix */,
-		//PicoGL.FLOAT_MAT4 /* 4 - projection from view matrix */
-	])
-	.set(0, sceneSettings.ambientColor)
-	//.set(1, directionalLight.color)
-	//.set(2, directionalLight.direction)
-	//.set(3, camera.viewMatrix)
-	//.set(4, camera.projectionMatrix)
-	.update();
-
-/*
-	camera.onViewMatrixChange = function(newValue) {
-		sceneUniforms.set(3, newValue).update();
-	};
-
-	camera.onProjectionMatrixChange = function(newValue) {
-		sceneUniforms.set(4, newValue).update();
-	};
-*/
-
-}
-
-function createVertexArrayFromMeshInfo(meshInfo) {
-
-	var positions = app.createVertexBuffer(PicoGL.FLOAT, 3, meshInfo.positions);
-	var normals   = app.createVertexBuffer(PicoGL.FLOAT, 3, meshInfo.normals);
-	var tangents  = app.createVertexBuffer(PicoGL.FLOAT, 4, meshInfo.tangents);
-	var texCoords = app.createVertexBuffer(PicoGL.FLOAT, 2, meshInfo.uvs);
-
-	var vertexArray = app.createVertexArray()
-	.vertexAttributeBuffer(0, positions)
-	.vertexAttributeBuffer(1, normals)
-	.vertexAttributeBuffer(2, texCoords)
-	.vertexAttributeBuffer(3, tangents);
-
-	return vertexArray;
-
+		// .colorTarget(0, colorBuffer)
+		.depthTarget(depthBuffer);
 }
 
 function setupProbeDrawCall(vertexArray, shader) {
-
 	// We need at least one (x,y,z) pair to render any probes
-	if (probeLocations.length <= 3) {
+	if (probeLocations.length <= 0) {
+		console.error('Probe locations invalid!');
 		return;
 	}
 
-	if (probeLocations.length % 3 !== 0) {
-		console.error('Probe locations invalid! Number of coordinates is not divisible by 3.');
-		return;
+	var offsetsArray = new Float32Array(probeLocations.length * 3); // 64 * 3
+	for (var i = 0, len = probeLocations.length; i < len; ++i) {
+		offsetsArray[3 * i + 0] = probeLocations[i][0];
+		offsetsArray[3 * i + 1] = probeLocations[i][1];
+		offsetsArray[3 * i + 2] = probeLocations[i][2];
 	}
 
 	// Set up for instanced drawing at the probe locations
-	var translations = app.createVertexBuffer(PicoGL.FLOAT, 3, new Float32Array(probeLocations));
-	vertexArray.instanceAttributeBuffer(10, translations);
+	var offsets = app.createVertexBuffer(PicoGL.FLOAT, 3, offsetsArray);
+	vertexArray.instanceAttributeBuffer(10, offsets);
 
 	probeDrawCall = app.createDrawCall(shader, vertexArray)
-	.uniform('u_color', vec3.fromValues(0, 1, 0));
+		.uniform('u_color', vec3.fromValues(1, 0, 0));
 
 }
+
+function initiatePrecompute() {
+	console.log('==== about to initiatePrecompute ======= ')
+	// console.log('precomputeIndex', precomputeIndex)
+	precomputeQueue = [...Array(probeLocations.length).keys()];
+	precomputeThisFrame = true;
+	precomputeIndex = 0;
+	precomputeTimes = [];
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -397,68 +248,41 @@ function resize() {
 ////////////////////////////////////////////////////////////////////////////////
 // Rendering
 
-function render() {
-	var startStamp = new Date().getTime();
-
-	stats.begin();
-	picoTimer.start();
+async function render() {
 	{
-		camera.update();
-
+		// camera.update(); ?????????? for what...
 		renderShadowMap();
 		renderScene();
+		if (precomputeThisFrame) {
+			let start = new Date().getTime();
 
+			if (precomputeIndex < probeLocations.length) {
+				precomputeProbe(precomputeIndex);
+				precomputeIndex++;
+			}		
+
+			precomputeTimes.push(new Date().getTime() - start);
+
+			if (precomputeIndex == probeLocations.length) {
+				var avgTime = precomputeTimes.reduce((prev, curr) => prev + curr) / probeLocations.length;
+				console.log('Average time of precomputing one probe: '  + avgTime.toPrecision(3) + 'ms');
+				precomputeThisFrame = false;
+				precomputeIndex = 0;
+				precomputeTimes = [];
+			}
+		}
+
+		// render probe
 		var viewProjection = mat4.mul(mat4.create(), camera.projectionMatrix, camera.viewMatrix);
 		renderProbes(viewProjection);
 
-		var inverseViewProjection = mat4.invert(mat4.create(), viewProjection);
-		renderEnvironment(inverseViewProjection)
-
-		// Call this to get a debug render of the passed in texture
-		//renderTextureToScreen(shadowMap);
-
 	}
-	picoTimer.end();
-	stats.end();
-
-	if (picoTimer.ready()) {
-		gpuTimePanel.update(picoTimer.gpuTime, 35);
-	}
-
-	//requestAnimationFrame(render);
-
-	var renderDelta = new Date().getTime() - startStamp;
-	setTimeout( function() {
-		requestAnimationFrame(render);
-	}, 1000 / settings.target_fps - renderDelta-1000/120);
-
-}
-
-function shadowMapNeedsRendering() {
-
-	var lastDirection = shadowMapNeedsRendering.lastDirection || vec3.create();
-	var lastMeshCount = shadowMapNeedsRendering.lastMeshCount || 0;
-
-	if (vec3.equals(lastDirection, directionalLight.direction) && lastMeshCount === meshes.length) {
-
-		return false;
-
-	} else {
-
-		shadowMapNeedsRendering.lastDirection = vec3.copy(lastDirection, directionalLight.direction);
-		shadowMapNeedsRendering.lastMeshCount = meshes.length;
-
-		return true;
-
-	}
-
+	requestAnimationFrame(render);
 
 }
 
 function renderShadowMap() {
-
 	if (!directionalLight) return;
-	if (!shadowMapNeedsRendering()) return;
 
 	var lightViewProjection = directionalLight.getLightViewProjectionMatrix();
 
@@ -470,16 +294,13 @@ function renderShadowMap() {
 	.clear();
 
 	for (var i = 0, len = meshes.length; i < len; ++i) {
-
 		var mesh = meshes[i];
 
 		mesh.shadowMapDrawCall
 		.uniform('u_world_from_local', mesh.modelMatrix)
 		.uniform('u_light_projection_from_world', lightViewProjection)
 		.draw();
-
 	}
-
 }
 
 function renderScene() {
@@ -498,25 +319,30 @@ function renderScene() {
 	for (var i = 0, len = meshes.length; i < len; ++i) {
 
 		var mesh = meshes[i];
-
 		mesh.drawCall
-		.uniform('u_world_from_local', mesh.modelMatrix)
-		.uniform('u_view_from_world', camera.viewMatrix)
-		.uniform('u_projection_from_view', camera.projectionMatrix)
-		.uniform('u_dir_light_color', directionalLight.color)
-		.uniform('u_dir_light_view_direction', dirLightViewDirection)
-		.uniform('u_light_projection_from_world', lightViewProjection)
-		.texture('u_shadow_map', shadowMap)
-		.draw();
-
+			.uniform('u_world_from_local', mesh.modelMatrix)
+			.uniform('u_view_from_world', camera.viewMatrix)
+			.uniform('u_projection_from_view', camera.projectionMatrix)
+			.uniform('u_dir_light_color', directionalLight.color)
+			.uniform('u_dir_light_view_direction', dirLightViewDirection)
+			.uniform('u_dir_light_multiplier', 65.0)
+			.uniform('u_light_projection_from_world', lightViewProjection)
+			.texture('u_shadow_map', shadowMap)
+			.uniform('u_ambient_multiplier', 0.78)
+			.uniform('u_indirect_multiplier', 0.56)
+			// light field probe params
+			.texture('L.irradianceProbeGrid', probeOctahedrals['irradiance'])
+			.texture('L.meanDistProbeGrid', probeOctahedrals['filteredDistance'])
+			.uniform('L.probeCounts', probeCount)
+			.uniform('L.probeStartPosition', probeOrigin)
+			.uniform('L.probeStep', probeStep) // input of frag shader
+			.draw();
 	}
-
 }
 
 function renderProbes(viewProjection) {
 
 	if (probeDrawCall) {
-
 		app.defaultDrawFramebuffer()
 		.defaultViewport()
 		.depthTest()
@@ -526,54 +352,76 @@ function renderProbes(viewProjection) {
 		probeDrawCall
 		.uniform('u_projection_from_world', viewProjection)
 		.draw();
-
 	}
-
 }
 
-function renderEnvironment(inverseViewProjection) {
+function precomputeProbe(probeIndex) {
+	var projectionMatrix = mat4.create();
+	mat4.perspective(projectionMatrix, Math.PI / 2.0, 1.0, 0.1, 100.0); // out, fovy, aspect, near, far
 
-	if (environmentDrawCall) {
+	var viewMatrix = mat4.create()
+	var cam
+	
+	// Draw the radiance, distance and depth for each side of cubemaps
+	for (var i = 0; i < 6; i++) {
+		probeFramebuffer.colorTarget(0, probeCubemaps['radiance'], i)
+						.colorTarget(1, probeCubemaps['distance'], i)
+						.depthTarget(probeCubemaps['depth'], i);
 
-		app.defaultDrawFramebuffer()
-		.defaultViewport()
-		.depthTest()
-		.depthFunc(PicoGL.EQUAL)
-		.noBlend();
+		viewMatrix, cam = createCamera(probeLocations[probeIndex], CUBE_LOOK_DIR[i], CUBE_LOOK_UP[i])
 
-		environmentDrawCall
-		.uniform('u_camera_position', camera.position)
-		.uniform('u_world_from_projection', inverseViewProjection)
-		.uniform('u_environment_brightness', settings.environment_brightness)
-		.draw();
+		var dirLightViewDirection = directionalLight.viewSpaceDirection(cam); // directionalight in camera space
+		var lightViewProjection = directionalLight.getLightViewProjectionMatrix();
+		var shadowMap = shadowMapFramebuffer.depthTexture;
 
+		app.drawFramebuffer(probeFramebuffer)
+			.viewport(0, 0, probeCubeSize, probeCubeSize)
+			.depthTest()
+			.depthFunc(PicoGL.LEQUAL)
+			.noBlend()
+			.clear()
+		
+		for (var j = 0; j < meshes.length; ++j) {
+			var mesh = meshes[j]
+			mesh.precomputeDrawCall
+				.uniform('u_world_from_local', mesh.modelMatrix)
+				.uniform('u_view_from_world', viewMatrix)
+				.uniform('u_projection_from_view', projectionMatrix)
+				.uniform('u_dir_light_color', directionalLight.color)
+				.uniform('u_dir_light_view_direction', dirLightViewDirection)
+				.uniform('u_dir_light_multiplier', 65.0)
+				.uniform('u_light_projection_from_world', lightViewProjection)
+				.texture('u_shadow_map', shadowMap)
+				.uniform('u_ambient_multiplier', 0.08)
+				.draw();
+		}
 	}
 
+	// draw probeOctahedrals['irradiance']
+	// irradianceFramebuffer.colorTarget(0, probeOctahedrals['irradiance'], probeIndex)
+	
+	// app.drawFramebuffer(irradianceFramebuffer)
+	// 	.viewport(0, 0, irradianceSize, irradianceSize)
+	// 	.noDepthTest()
+	// 	.noBlend()
+	
+	// irradianceDrawCall.texture('u_radiance_cubemap', probeCubemaps['radiance'])
+	// 	.uniform('u_num_samples', 2048)
+	// 	.uniform('u_lobe_size', 0.99)
+	// 	.draw()
+
+
+	// // draw probeOctahedrals['filteredDistance']
+	// irradianceFramebuffer.colorTarget(0, probeOctahedrals['filteredDistance'], probeIndex)
+
+	// app.drawFramebuffer(irradianceFramebuffer)
+	// 	.viewport(0, 0, irradianceSize, irradianceSize)
+	// 	.noDepthTest()
+	// 	.noBlend()
+	
+	// irradianceDrawCall.texture('u_radiance_cubemap', probeCubemaps['radiance'])
+	// 	.uniform('u_num_samples', 128)
+	// 	.uniform('u_lobe_size', 0.50)
+	// 	.draw()
+
 }
-
-function renderTextureToScreen(texture) {
-
-	//
-	// NOTE:
-	//
-	//   This function can be really helpful for debugging!
-	//   Just call this whenever and you get the texture on
-	//   the screen (just make sure nothing is drawn on top)
-	//
-
-	if (!blitTextureDrawCall) {
-		return;
-	}
-
-	app.defaultDrawFramebuffer()
-	.defaultViewport()
-	.noDepthTest()
-	.noBlend();
-
-	blitTextureDrawCall
-	.texture('u_texture', texture)
-	.draw();
-
-}
-
-////////////////////////////////////////////////////////////////////////////////

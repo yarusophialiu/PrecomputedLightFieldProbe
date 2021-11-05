@@ -1,6 +1,4 @@
 #version 300 es
-
-// TODO: We propbably don't need all of this precision! Just for making sure while debugging...
 precision highp int;
 precision highp float;
 precision highp sampler2D;
@@ -11,7 +9,7 @@ precision highp sampler2DArray;
 //
 // NOTE: All fragment calculations are in *view space*
 //
-// below are from vertex shader
+
 in vec3 v_position;
 in vec3 v_normal;
 in vec3 v_tangent;
@@ -32,27 +30,10 @@ uniform vec3 u_dir_light_color;
 uniform vec3 u_dir_light_view_direction;
 uniform float u_dir_light_multiplier;
 
-uniform float u_indirect_multiplier;
 uniform float u_ambient_multiplier;
 
-///////////////////////////////////
-// GI related
-
-uniform struct LightFieldSurface
-{
-	Vector3int32            probeCounts; // assumed to be a power of two!
-	Point3                  probeStartPosition;
-	Vector3                 probeStep;
-	// int                     lowResolutionDownsampleFactor;
-	sampler2DArray          irradianceProbeGrid; // TODO: Size!
-	sampler2DArray          meanDistProbeGrid;   // TODO: Size!
-} L;
-
-#include <light_field_probe_diffuse.glsl>
-
-///////////////////////////////////
-
 layout(location = 0) out vec4 o_color;
+layout(location = 1) out vec4 o_distance;
 
 void main()
 {
@@ -108,19 +89,12 @@ void main()
 			color += visibility * shininess * specular * u_dir_light_color * u_dir_light_multiplier;
 		}
 	}
-	//////////////////////////////////////////////////////////
-	// indirect light
 
-	vec3 fragment_world_space_pos = v_world_position;
-	vec3 fragment_world_space_normal = normalize(v_world_space_normal);
 
-	vec3 indirect_diffuse_light = computePrefilteredIrradiance(fragment_world_space_pos, fragment_world_space_normal);
-	color += u_indirect_multiplier * diffuse * indirect_diffuse_light;
-
-	//////////////////////////////////////////////////////////
-
-	color = color / (color + vec3(1.0));
-
+	// We want the distance from the camera to the fragments for the octahedrals
+	float distance_to_fragment = length(v_position);
+	
 	o_color = vec4(color, 1.0);
+	o_distance = vec4(distance_to_fragment, distance_to_fragment * distance_to_fragment, 0.0, 0.0);
 
 }

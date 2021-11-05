@@ -14,6 +14,8 @@ out vec3 v_tangent;
 out vec3 v_bitangent;
 out vec2 v_tex_coord;
 out vec4 v_light_space_position;
+out vec3 v_world_position;
+out vec3 v_world_space_normal;
 
 void main()
 {
@@ -24,16 +26,21 @@ void main()
 	vec4 view_space_normal   = view_from_local * vec4(a_normal, 0.0);
 	vec4 view_space_tangent  = view_from_local * vec4(a_tangent.xyz, 0.0);
 
+	vec4 world_space_normal = normalize(u_world_from_local * vec4(a_normal, 0.0));
+	vec4 world_space_position = u_world_from_local * vec4(a_position, 1.0);
+
 	v_position  = vec3(view_space_position);
 	v_normal    = vec3(view_space_normal);
 	v_tangent   = vec3(view_space_tangent);
 	v_bitangent = vec3(vec3(a_tangent.w) * cross(view_space_normal.xyz, view_space_tangent.xyz));
 
+	v_world_position = vec3(world_space_position);
+	v_world_space_normal = vec3(world_space_normal);
+
 	v_tex_coord = a_tex_coord;
 
 	// TODO: Clean up these these transformations into one matrix multiplication
 	// (i.e. from camera view space to light projected with bias and offset)
-	vec4 world_space_position = u_world_from_local * vec4(a_position, 1.0);
 	v_light_space_position = u_light_projection_from_world * vec4(world_space_position.xyz, 1.0);
 	v_light_space_position *= vec4(0.5, 0.5, 0.5, 1.0);
 	v_light_space_position += vec4(0.5, 0.5, 0.5, 0.0);
